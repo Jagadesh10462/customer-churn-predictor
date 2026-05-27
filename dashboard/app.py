@@ -1,10 +1,15 @@
 import streamlit as st
-import requests
-import json
 import pandas as pd
 import plotly.graph_objects as go
+import joblib
+import numpy as np
+import sqlite3
+import json
+import os
+from groq import Groq
+from dotenv import load_dotenv
 
-API_URL = "http://127.0.0.1:8000"
+load_dotenv()
 
 st.set_page_config(
     page_title="Customer Churn Predictor",
@@ -12,11 +17,109 @@ st.set_page_config(
     layout="wide"
 )
 
+# Load model directly
+@st.cache_resource
+def load_model():
+    model = joblib.load("model/churn_model.pkl")
+    explainer = joblib.load("model/shap_explainer.pkl")
+    return model, explainer
+
+model, explainer = load_model()
+
+FEATURE_NAMES = [
+    "gender", "SeniorCitizen", "Partner", "Dependents", "tenure",
+    "PhoneService", "MultipleLines", "InternetService", "OnlineSecurity",
+    "OnlineBackup", "DeviceProtection", "TechSupport", "StreamingTV",
+    "StreamingMovies", "Contract", "PaperlessBilling", "PaymentMethod",
+    "MonthlyCharges", "TotalCharges"
+]
+
+DB_PATH = "db/churn.db"
+
+def init_db():
+    os.makedirs("db", exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_data TEXT NOT NULL,
+            churn_probability REAL NOT NULL,
+            churn_prediction INTEGER NOT NULL,
+            explanation TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_prediction(customer: dict):
+    features = np.array([[customer[f] for f in FEATURE_NAMES]])
+    prob = model.predict_proba(features)[0][1]
+    prediction = int(prob >= 0.5)
+
+    shap_values = explainer.shap_values(features)[0]
+    top_factors = sorted(
+        zip(FEATURE_NAMES, shap_values),
+        key=lambda x: abs(x[1]),
+        reverse=True
+    )[:3]
+
+    factors_text = "\n".join([
+        f"- {name}: impact score {value:.3f}"
+        for name, value in top_factors
+    ])
+
+    prompt = f"""A telecom customer has a {prob*100:.1f}% probability of churning.
+
+Top 3 factors driving this prediction:
+{factors_text}
+
+In 2-3 simple sentences, explain to a non-technical business manager:
+1. Will this customer likely churn?
+2. What are the main reasons?
+3. What action should be taken?
+
+Be direct and practical."""
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        api_key = st.secrets.get("GROQ_API_KEY", "")
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=200
+    )
+    explanation = response.choices[0].message.content
+
+    # Save to SQLite
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO predictions
+           (customer_data, churn_probability, churn_prediction, explanation)
+           VALUES (?, ?, ?, ?)""",
+        (json.dumps(customer), round(float(prob), 4),
+         prediction, explanation)
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "churn_probability": round(float(prob), 4),
+        "churn_prediction": prediction,
+        "risk_level": "High" if prob >= 0.7 else "Medium" if prob >= 0.4 else "Low",
+        "explanation": explanation,
+        "top_factors": [{"feature": n, "impact": round(float(v), 4)}
+                        for n, v in top_factors]
+    }
+
 st.title("📊 Customer Churn Predictor")
 st.markdown("*Powered by XGBoost + Groq AI — Built for Infosys DSE*")
 st.divider()
 
-# Sidebar inputs
 st.sidebar.header("Customer Details")
 
 gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
@@ -42,7 +145,6 @@ payment = st.sidebar.selectbox("Payment Method", [
 monthly_charges = st.sidebar.number_input("Monthly Charges ($)", min_value=0.0, max_value=150.0, value=70.0, step=0.5)
 total_charges = st.sidebar.number_input("Total Charges ($)", min_value=0.0, max_value=9000.0, value=1000.0, step=10.0)
 
-# Encode inputs
 def encode():
     return {
         "gender": 1 if gender == "Male" else 0,
@@ -67,18 +169,13 @@ def encode():
         "TotalCharges": total_charges
     }
 
-# Predict button
 if st.sidebar.button("🔍 Predict Churn", type="primary"):
     with st.spinner("Analyzing customer..."):
         try:
-            response = requests.post(f"{API_URL}/predict", json=encode())
-            result = response.json()
-
-            # Risk color
+            result = get_prediction(encode())
             color = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
             risk = result["risk_level"]
 
-            # Top row metrics
             col1, col2, col3 = st.columns(3)
             col1.metric("Churn Probability", f"{result['churn_probability']*100:.1f}%")
             col2.metric("Prediction", "Will Churn ❌" if result["churn_prediction"] == 1 else "Will Stay ✅")
@@ -86,7 +183,6 @@ if st.sidebar.button("🔍 Predict Churn", type="primary"):
 
             st.divider()
 
-            # Gauge chart
             col4, col5 = st.columns(2)
             with col4:
                 st.subheader("📈 Churn Risk Gauge")
@@ -106,7 +202,6 @@ if st.sidebar.button("🔍 Predict Churn", type="primary"):
                 ))
                 st.plotly_chart(fig, use_container_width=True)
 
-            # SHAP factors
             with col5:
                 st.subheader("🔍 Top Churn Factors (SHAP)")
                 factors_df = pd.DataFrame(result["top_factors"])
@@ -124,8 +219,6 @@ if st.sidebar.button("🔍 Predict Churn", type="primary"):
                 st.plotly_chart(fig2, use_container_width=True)
 
             st.divider()
-
-            # AI Explanation
             st.subheader("🤖 AI Explanation (Groq Llama)")
             st.info(result["explanation"])
 
@@ -133,14 +226,17 @@ if st.sidebar.button("🔍 Predict Churn", type="primary"):
             st.error(f"Error: {str(e)}")
 
 st.divider()
-
-# History section
 st.subheader("📋 Recent Predictions")
 if st.button("Load History"):
     try:
-        history = requests.get(f"{API_URL}/history").json()
-        if history:
-            df = pd.DataFrame(history)[
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM predictions ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        conn.close()
+        if rows:
+            df = pd.DataFrame([dict(r) for r in rows])[
                 ["id", "churn_probability", "churn_prediction", "created_at"]
             ]
             df["churn_prediction"] = df["churn_prediction"].map(
