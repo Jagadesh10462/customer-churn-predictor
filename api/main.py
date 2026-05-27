@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import mysql.connector
+import sqlite3
 import json
 from dotenv import load_dotenv
 import os
@@ -10,13 +10,28 @@ load_dotenv()
 
 app = FastAPI(title="Churn Predictor API", version="1.0")
 
+DB_PATH = "db/churn.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_data TEXT NOT NULL,
+            churn_probability REAL NOT NULL,
+            churn_prediction INTEGER NOT NULL,
+            explanation TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
 def get_db():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        database=os.getenv("DB_NAME")
-    )
+    return sqlite3.connect(DB_PATH)
 
 class CustomerData(BaseModel):
     gender: int
@@ -48,18 +63,16 @@ def predict(customer: CustomerData):
     try:
         result = get_prediction(customer.dict())
 
-        # Save to MySQL
         db = get_db()
         cursor = db.cursor()
         cursor.execute(
-            """INSERT INTO predictions 
-               (customer_data, churn_probability, churn_prediction, explanation) 
-               VALUES (%s, %s, %s, %s)""",
+            """INSERT INTO predictions
+               (customer_data, churn_probability, churn_prediction, explanation)
+               VALUES (?, ?, ?, ?)""",
             (json.dumps(customer.dict()), result["churn_probability"],
              result["churn_prediction"], result["explanation"])
         )
         db.commit()
-        cursor.close()
         db.close()
 
         return result
@@ -71,12 +84,12 @@ def predict(customer: CustomerData):
 def get_history():
     try:
         db = get_db()
-        cursor = db.cursor(dictionary=True)
+        db.row_factory = sqlite3.Row
+        cursor = db.cursor()
         cursor.execute(
             "SELECT * FROM predictions ORDER BY created_at DESC LIMIT 10"
         )
-        rows = cursor.fetchall()
-        cursor.close()
+        rows = [dict(row) for row in cursor.fetchall()]
         db.close()
         return rows
     except Exception as e:
